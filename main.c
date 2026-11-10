@@ -25,9 +25,10 @@
 #define PIN_VDD_ENV         22
 #define PIN_R_PULLUP        32
 
-#define LED_TIMEOUT_TICKS       1U
+#define LED_TIMEOUT_MS          500U
+#define GESTURE_TIMEOUT_MS      3000U
+
 #define DISPLAY_TIMEOUT_TICKS   5U
-#define GESTURE_TIMEOUT_TICKS   5U
 
 typedef enum {
   PROXIMITY,
@@ -35,19 +36,23 @@ typedef enum {
 } State;
 
 /* TIMER instance */
-static const nrf_drv_timer_t timer0 = NRF_DRV_TIMER_INSTANCE(0); //timer that counts for 1s
+// timer that counts for 1s
+static const nrf_drv_timer_t timer0 = NRF_DRV_TIMER_INSTANCE(0);
+// timer1 for led timeout and APDS sensor timeout
+static const nrf_drv_timer_t timer1 = NRF_DRV_TIMER_INSTANCE(1);
 
 /* Global variable for 1s Timer interrupt */
 volatile uint32_t total_sec = 0;
 volatile bool timer_update_flag = false;
 
-volatile uint32_t led_global_timer = 0;
+volatile uint32_t led_started_ticks = 0;
 volatile bool is_led_on = false;
 
+// display off when this timer >= 5
 volatile uint32_t display_global_timer = 0;
 volatile bool is_display_on = false;
 
-volatile uint32_t gesture_global_timer = 0;
+volatile uint32_t gesture_activity_ticks = 0;
 
 volatile State current_state = PROXIMITY;
 volatile bool proximity_interrupt_flag = false;
@@ -93,14 +98,8 @@ void timer_interrupt_handler(nrf_timer_event_t event_type, void* p_context)
 
   total_sec++;
   
-  if (is_led_on && led_global_timer < LED_TIMEOUT_TICKS) 
-    led_global_timer++;
-  
   if (is_display_on && display_global_timer < DISPLAY_TIMEOUT_TICKS) 
     display_global_timer++;
-  
-  if (current_state == GESTURE && gesture_global_timer < GESTURE_TIMEOUT_TICKS)
-    gesture_global_timer++;
 
   timer_update_flag = true;
 
@@ -131,6 +130,32 @@ static void timer0_init (void)
 
 }
 
+/* Fake timer handler */
+static void timer1_handler (nrf_timer_event_t event, void *context)
+{
+  (void)event;
+  (void)context;
+}
+
+static void timer1_init(void)
+{
+  nrf_drv_timer_config_t config = NRF_DRV_TIMER_DEFAULT_CONFIG;
+
+  // Set TIMER1 1 MHz, 32-bit
+  config.frequency = NRF_TIMER_FREQ_1MHz;
+  config.mode      = NRF_TIMER_MODE_TIMER;
+  config.bit_width = NRF_TIMER_BIT_WIDTH_32;
+
+  APP_ERROR_CHECK(nrf_drv_timer_init(&timer1, &config, timer1_handler));
+
+  nrf_drv_timer_clear(&timer1);
+  nrf_drv_timer_enable(&timer1);
+}
+
+static uint32_t timer1_now(void)
+{
+  return nrf_drv_timer_capture(&timer1, NRF_TIMER_CC_CHANNEL0);
+}
 
 static void refresh_clock(void)
 {
@@ -157,6 +182,10 @@ void on_gesture(int gesture)
 
   // LED on
   led_control(LED_WHITE, false);
+
+  led_started_ticks = timer1_now();
+  is_led_on = true;
+
   switch (gesture) {
     case GESTURE_UP:
       led_control(LED_RED, true);
@@ -254,9 +283,7 @@ int main(void)
   is_led_on = false;
   current_state = PROXIMITY;
 
-  led_global_timer = 0;
   display_global_timer = 0;
-  gesture_global_timer = 0;
   timer_update_flag = false;
   
   //set initial time
@@ -266,7 +293,20 @@ int main(void)
   total_sec = 3600U * initial_hour + 60 * initial_min + initial_sec;
 
   // timer initialization
+  timer1_init();
   timer0_init();
+
+  const uint32_t led_timeout_ticks = 
+    nrf_drv_timer_ms_to_ticks(
+      &timer1, 
+      LED_TIMEOUT_MS
+    );
+  
+  const uint32_t gesture_timeout_ticks = 
+    nrf_drv_timer_ms_to_ticks(
+      &timer1, 
+      GESTURE_TIMEOUT_MS
+    );
 
   /**********************************************/
 
@@ -294,10 +334,8 @@ int main(void)
                 // change to gesture mode
                 APP_ERROR_CHECK_BOOL(apds_gesture_mode());
 
-                CRITICAL_REGION_ENTER();
-                gesture_global_timer = 0;
+                gesture_activity_ticks = timer1_now();
                 current_state = GESTURE;
-                CRITICAL_REGION_EXIT();
             }
         }
 
@@ -315,11 +353,10 @@ int main(void)
           
           // init global time counter
           CRITICAL_REGION_ENTER();
-          led_global_timer = 0;
           display_global_timer = 0;
-          gesture_global_timer = 0;
-          is_led_on = true;
           CRITICAL_REGION_EXIT();
+
+          gesture_activity_ticks = timer1_now();
 
           // control display, control led
           on_gesture(gesture);
@@ -340,8 +377,12 @@ int main(void)
         break;
     }
 
-    // LED 자동 끄기: 매 루프
-    if (is_led_on && led_global_timer >= LED_TIMEOUT_TICKS) {
+    uint32_t now = timer1_now();
+
+    // LED 500ms 자동 끄기: 매 루프
+    if (is_led_on && 
+      (uint32_t)(now - led_started_ticks) >= led_timeout_ticks) 
+    {
       led_control(LED_WHITE, false);
       is_led_on = false;
     }
@@ -353,19 +394,18 @@ int main(void)
       is_display_on = false;
     }
 
-    // 제스처 모드 자동 끄기: 매 루프
+    // 제스처 모드 3000ms 자동 끄기: 매 루프
     // gesture mode off, proximity on
-    if (current_state == GESTURE && gesture_global_timer >= GESTURE_TIMEOUT_TICKS) {
+    if (current_state == GESTURE && 
+      (now - gesture_activity_ticks) >= gesture_timeout_ticks) 
+    {
       CRITICAL_REGION_ENTER();
       proximity_interrupt_flag = false;
       CRITICAL_REGION_EXIT();
 
       APP_ERROR_CHECK_BOOL(apds_proximity_mode());
 
-      CRITICAL_REGION_ENTER();
       current_state = PROXIMITY;
-      gesture_global_timer = 0;
-      CRITICAL_REGION_EXIT();
     }
     
     bool update;

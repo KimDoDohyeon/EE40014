@@ -18,7 +18,7 @@
 #define APDS_ADDR           0x39U
 #define APDS_REG_ENABLE     0x80U
 #define APDS_REG_ID         0x92U
- 
+
 #define APDS_REG_GCONFIG1   0xA2U
 #define APDS_REG_GCONFIG2   0xA3U
 
